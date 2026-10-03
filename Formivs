@@ -1,0 +1,606 @@
+formularioS_controller:
+<?php
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+require_once __DIR__ . '/../Model/conexion.php';
+require_once __DIR__ . '/../Helper/mailer_helper.php';
+
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+    $id_tipo_solicitud_fk = $_POST['id_tipo_solicitud_fk']; 
+    $id_urgencia_fk = $_POST['id_urgencia_fk']; 
+    $fecha = $_POST['fecha'];
+    $funcionalidad = $_POST['funcionalidad'];
+    $necesidad = $_POST['necesidad'];
+    $impacto_user = $_POST['impacto_user'];
+    $areas_afectadas = isset($_POST['areas_afectadas']) ? implode(', ', $_POST['areas_afectadas']) : '';
+    $area_solicitante = $_SESSION['user'] ?? 'Desconocido';
+    $correo_solicitante = $_SESSION['correo'] ?? 'No registrado';
+    $nombre_solicitud = $_POST['nombre_solicitud'];
+    
+    $id_usuario_f = $_SESSION['id_usuario'] ?? null;
+
+    $rutaArchivoDestino = null;    
+    $rutaParaBD = null;            
+
+    if (isset($_FILES['archivo']) && $_FILES['archivo']['error'] === UPLOAD_ERR_OK) {
+        $nombreOriginal = $_FILES['archivo']['name'];
+        $tmpName = $_FILES['archivo']['tmp_name'];
+        
+        $nombreUnico = uniqid() . '_' . basename($nombreOriginal);
+        $directorioSubidas = __DIR__ . '/../uploads/';
+        
+        if (!is_dir($directorioSubidas)) {
+            mkdir($directorioSubidas, 0755, true);
+        }
+        
+        $rutaArchivoDestino = $directorioSubidas . $nombreUnico;
+        
+        if (move_uploaded_file($tmpName, $rutaArchivoDestino)) {
+            $rutaParaBD = 'uploads/' . $nombreUnico;
+        }
+    }
+
+    try {
+        $conexion->beginTransaction();
+
+        // Obtenemos rol, indicador es_jefe, área y el id_jefe real de su área (excluyéndose a sí mismo)
+        $stmt_area = $conexion->prepare("
+            SELECT u_empleado.rol, 
+                   u_empleado.es_jefe,
+                   t_empleado.id_area_fk, 
+                   (SELECT u_jefe.id_usuario 
+                    FROM usuario u_jefe 
+                    INNER JOIN trabajador t_jefe ON u_jefe.id_trabajador_fk = t_jefe.id
+                    WHERE t_jefe.id_area_fk = t_empleado.id_area_fk 
+                      AND u_jefe.es_jefe = 1 
+                      AND u_jefe.id_usuario != u_empleado.id_usuario
+                    LIMIT 1) AS id_jefe
+            FROM usuario u_empleado 
+            LEFT JOIN trabajador t_empleado ON u_empleado.id_trabajador_fk = t_empleado.id
+            WHERE u_empleado.id_usuario = ?
+        ");
+        $stmt_area->execute([$id_usuario_f]);
+        $datos_usuario = $stmt_area->fetch(PDO::FETCH_ASSOC);
+
+        $rol_creador = strtolower($datos_usuario['rol'] ?? 'solicitante');
+        $es_jefe = intval($datos_usuario['es_jefe'] ?? 0);
+        $id_jefe_encontrado = $datos_usuario['id_jefe'] ?? null;
+
+        // REGLA 1: Administradores, Gerentes, Jefes de Área (por rol o por es_jefe = 1) van directo a administración
+        if (
+            $es_jefe === 1 ||
+            in_array($rol_creador, ['administrador', 'admin', 'gerencia', 'gerente', 'jefe_area', 'jefe'])
+        ) {
+            $estado_inicial = 'pendiente_administracion'; 
+        } else {
+            // REGLA 2 y 3: Solicitantes comunes
+            if (!empty($id_jefe_encontrado)) {
+                $estado_inicial = 'pendiente_jefe'; // Va primero al jefe de su área
+            } else {
+                $estado_inicial = 'pendiente_gerencia'; // Si no hay jefe en su área, va directo a gerencia
+            }
+        }
+
+        $sql = "INSERT INTO requerimientos (id_tipo_solicitud_fk, id_urgencia_fk, fecha, funcionalidad, necesidad, impacto_user, areas_afectadas, area_solicitante, nombre_solicitud, id_usuario_f, archivo_adjunto, estado) 
+                VALUES (:id_tipo_solicitud_fk, :id_urgencia_fk, :fecha, :funcionalidad, :necesidad, :impacto_user, :areas_afectadas, :area_solicitante, :nombre_solicitud, :id_usuario_f, :archivo_adjunto, :estado)";
+        
+        $stmt = $conexion->prepare($sql);
+        $stmt->execute([
+            ':id_tipo_solicitud_fk' => $id_tipo_solicitud_fk,
+            ':id_urgencia_fk' => $id_urgencia_fk,
+            ':fecha' => $fecha,
+            ':funcionalidad' => $funcionalidad,
+            ':necesidad' => $necesidad,
+            ':impacto_user' => $impacto_user,
+            ':areas_afectadas' => $areas_afectadas,
+            ':area_solicitante' => $area_solicitante,
+            ':nombre_solicitud' => $nombre_solicitud,
+            ':id_usuario_f' => $id_usuario_f,
+            ':archivo_adjunto' => $rutaParaBD,
+            ':estado' => $estado_inicial
+        ]);
+
+        $id_nuevo_requerimiento = $conexion->lastInsertId();
+        
+        $sqlProceso = "INSERT INTO procesos (id_requerimiento_fk, estado) VALUES (:id_req, :estado)";
+        $stmtProceso = $conexion->prepare($sqlProceso);
+        $stmtProceso->execute([
+            ':id_req' => $id_nuevo_requerimiento,
+            ':estado' => $estado_inicial
+        ]);
+
+        $conexion->commit();
+
+    } catch (PDOException $e) {
+        if ($conexion->inTransaction()) {
+            $conexion->rollBack();
+        }
+        die("Error al guardar en la BD: " . $e->getMessage());
+    }
+
+    try {
+        // Envíos de correos según el estado inicial generado
+        if ($estado_inicial === 'pendiente_jefe' && !empty($id_jefe_encontrado)) {
+            $stmtJefeCorreo = $conexion->prepare("
+                SELECT u.correo, COALESCE(t.nombres, u.correo) AS nombre 
+                FROM usuario u 
+                LEFT JOIN trabajador t ON u.id_trabajador_fk = t.id 
+                WHERE u.id_usuario = ?
+            ");
+            $stmtJefeCorreo->execute([$id_jefe_encontrado]);
+            $jefeData = $stmtJefeCorreo->fetch(PDO::FETCH_ASSOC);
+            $correoDestino = $jefeData['correo'] ?? 'priscilacortez353@gmail.com';
+            $nombreDestino = $jefeData['nombre'] ?? 'Jefe de Área';
+        } elseif ($estado_inicial === 'pendiente_gerencia') {
+            $sqlDestinatario = "
+                SELECT u.correo, COALESCE(t.nombres, u.correo) AS nombre 
+                FROM usuario u 
+                LEFT JOIN trabajador t ON u.id_trabajador_fk = t.id 
+                WHERE u.rol = 'gerencia' OR u.rol = 'gerente' 
+                LIMIT 1
+            ";
+            $stmtDestinatario = $conexion->query($sqlDestinatario);
+            $destinatarioData = $stmtDestinatario->fetch(PDO::FETCH_ASSOC);
+            $correoDestino = $destinatarioData['correo'] ?? 'priscilacortez353@gmail.com'; 
+            $nombreDestino = $destinatarioData['nombre'] ?? 'Gerencia';
+        } else {
+            $sqlAdmin = "
+                SELECT u.correo, COALESCE(t.nombres, u.correo) AS nombre 
+                FROM usuario u 
+                LEFT JOIN trabajador t ON u.id_trabajador_fk = t.id 
+                WHERE u.rol = 'administrador' OR u.rol = 'admin' 
+                LIMIT 1
+            ";
+            $stmtAdmin = $conexion->query($sqlAdmin);
+            $adminData = $stmtAdmin->fetch(PDO::FETCH_ASSOC);
+            $correoDestino = $adminData['correo'] ?? 'priscilacortez353@gmail.com'; 
+            $nombreDestino = $adminData['nombre'] ?? 'Administración';
+        }
+
+        if (!empty($fecha)) {
+            $timestamp = strtotime($fecha);
+            $dia = date('j', $timestamp); 
+            $meses = ['', 'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+            $mes = $meses[date('n', $timestamp)];
+            $anio = date('Y', $timestamp);
+            
+            $fechaFormateadaParaCorreo = "$dia de $mes $anio";
+        } else {
+            $fechaFormateadaParaCorreo = 'No especificada';
+        }
+
+        $asunto = "Nuevo Requerimiento: " . $nombre_solicitud;
+        $cuerpo = "Se ha registrado un nuevo requerimiento.<br><br>
+                    <b>Solicitante:</b> {$area_solicitante} ({$correo_solicitante}) <br>
+                    <b>Nombre de Solicitud:</b> {$nombre_solicitud} <br>
+                    <b>Fecha:</b> {$fechaFormateadaParaCorreo} <br>
+                    <b>Áreas Afectadas:</b> {$areas_afectadas} <br>
+                    <b>Flujo Inicial:</b> {$estado_inicial}";
+
+        enviarCorreoSistema(
+            $correoDestino, 
+            $nombreDestino, 
+            $asunto, 
+            $cuerpo, 
+            $rutaArchivoDestino, 
+            $correo_solicitante, 
+            $area_solicitante
+        );
+
+    } catch (Exception $e) {
+        // Manejo de errores de correo
+    }
+
+    header("Location: ../View/solicitud_view.php");
+    exit();
+}
+?>
+
+
+bandeja_jefe_controller:  <?php
+//variable hora peruana
+date_default_timezone_set('America/Lima');
+
+require_once __DIR__ . '/../Model/conexion.php';
+
+if (isset($conexion) && $conexion instanceof PDO) {
+    $conexion->exec("SET time_zone = '-05:00'");
+}
+
+try {
+    $id_jefe = $_SESSION['id_usuario'] ?? null;
+
+    if (!$id_jefe) {
+        throw new Exception("No hay sesión activa.");
+    }
+
+    // Consulta para obtener el área del jefe uniendo usuario con trabajador
+    $stmt_jefe = $conexion->prepare("
+        SELECT t.id_area_fk 
+        FROM usuario u 
+        INNER JOIN trabajador t ON u.id_trabajador_fk = t.id 
+        WHERE u.id_usuario = ? AND u.es_jefe = 1
+    ");
+    $stmt_jefe->execute([$id_jefe]);
+    $datos_jefe = $stmt_jefe->fetch(PDO::FETCH_ASSOC);
+
+    $requerimientos = [];
+
+    if ($datos_jefe) {
+        $id_area = $datos_jefe['id_area_fk'];
+
+        // Consulta para los requerimientos pendientes del área uniendo usuario, trabajador y urgencia
+        $sql = "SELECT r.*, 
+                       COALESCE(t.nombres, u.correo) AS nombre_usuario, 
+                       urg.urgencia AS nombre_urgencia 
+                FROM requerimientos r 
+                INNER JOIN usuario u ON r.id_usuario_f = u.id_usuario 
+                LEFT JOIN trabajador t ON u.id_trabajador_fk = t.id 
+                LEFT JOIN urgencia urg ON r.id_urgencia_fk = urg.id_urgencia
+                WHERE t.id_area_fk = ? AND r.estado = 'pendiente_jefe'
+                ORDER BY r.id_requerimiento DESC";
+
+        $stmt = $conexion->prepare($sql);
+        $stmt->execute([$id_area]);
+        $requerimientos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+} catch (Exception $e) {
+    $requerimientos = [];
+}
+?>
+
+
+
+
+
+jefe_acciones_controller:
+<?php
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+require_once __DIR__ . '/../Model/conexion.php';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $id_requerimiento = $_POST['id_requerimiento'] ?? null;
+    $accion = $_POST['accion'] ?? null;
+    $motivo_rechazo = $_POST['motivo_rechazo'] ?? null;
+
+    if ($id_requerimiento && $accion) {
+        try {
+            $conexion->beginTransaction();
+
+            $sqlCheck = "SELECT COUNT(*) FROM procesos WHERE id_requerimiento_fk = :id_req";
+            $stmtCheck = $conexion->prepare($sqlCheck);
+            $stmtCheck->execute([':id_req' => $id_requerimiento]);
+            $existe = $stmtCheck->fetchColumn();
+
+            if ($accion === 'aceptar') {
+                $nuevo_estado = 'pendiente_gerencia';
+
+                $stmt = $conexion->prepare("UPDATE requerimientos SET estado = ?, motivo_rechazo = NULL WHERE id_requerimiento = ?");
+                $stmt->execute([$nuevo_estado, $id_requerimiento]);
+
+                if ($existe > 0) {
+                    $sqlProc = "UPDATE procesos SET estado = ?, motivo_rechazo = NULL, fecha_actualizada = NOW() WHERE id_requerimiento_fk = ?";
+                    $stmtProc = $conexion->prepare($sqlProc);
+                    $stmtProc->execute([$nuevo_estado, $id_requerimiento]);
+                } else {
+                    $sqlProc = "INSERT INTO procesos (id_requerimiento_fk, estado, motivo_rechazo, fecha_actualizada) VALUES (?, ?, NULL, NOW())";
+                    $stmtProc = $conexion->prepare($sqlProc);
+                    $stmtProc->execute([$id_requerimiento, $nuevo_estado]);
+                }
+
+            } elseif ($accion === 'rechazar') {
+                $nuevo_estado = 'rechazado';
+
+                $stmt = $conexion->prepare("UPDATE requerimientos SET estado = ?, motivo_rechazo = ? WHERE id_requerimiento = ?");
+                $stmt->execute([$nuevo_estado, $motivo_rechazo, $id_requerimiento]);
+
+                if ($existe > 0) {
+                    $sqlProc = "UPDATE procesos SET estado = ?, motivo_rechazo = ?, fecha_actualizada = NOW() WHERE id_requerimiento_fk = ?";
+                    $stmtProc = $conexion->prepare($sqlProc);
+                    $stmtProc->execute([$nuevo_estado, $motivo_rechazo, $id_requerimiento]);
+                } else {
+                    $sqlProc = "INSERT INTO procesos (id_requerimiento_fk, estado, motivo_rechazo, fecha_actualizada) VALUES (?, ?, ?, NOW())";
+                    $stmtProc = $conexion->prepare($sqlProc);
+                    $stmtProc->execute([$id_requerimiento, $nuevo_estado, $motivo_rechazo]);
+                }
+            }
+            
+            $conexion->commit();
+            header("Location: ../View/bandeja_jefe_view.php");
+            exit();
+
+        } catch (Exception $e) {
+            if ($conexion->inTransaction()) {
+                $conexion->rollBack();
+            }
+            die("Error al procesar la acción: " . $e->getMessage());
+        }
+    }
+}
+?>
+
+
+
+
+solicitud_ge_controller:  
+<?php
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+require_once __DIR__ . '/../Model/conexion.php';
+
+$id_usuario_actual = $_SESSION['id_usuario'] ?? null;
+if (!$id_usuario_actual) {
+    header("Location: ../View/login_view.php");
+    exit();
+}
+
+try {
+    $sql = "SELECT r.*, 
+                   t.nombres AS nombre_usuario, 
+                   a.nombre_area AS nombre_area,
+                   COALESCE(urg.nombre_ur, 'Normal') AS nombre_urgencia
+            FROM requerimientos r
+            LEFT JOIN usuario u ON r.id_usuario_f = u.id_usuario
+            LEFT JOIN trabajador t ON u.id_trabajador_fk = t.id
+            LEFT JOIN areas a ON t.id_area_fk = a.id_area
+            LEFT JOIN urgencia urg ON r.id_urgencia_fk = urg.id_urgencia
+            WHERE LOWER(TRIM(r.estado)) = 'pendiente_gerencia'
+            ORDER BY r.id_requerimiento DESC";
+
+    $stmt = $conexion->prepare($sql);
+    $stmt->execute();
+    $requerimientos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+} catch (PDOException $e) {
+    $requerimientos = [];
+    $error_db = "Error al cargar las solicitudes: " . $e->getMessage();
+}
+?>
+
+
+
+
+gerencia_acciones_controller:
+<?php
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+require_once __DIR__ . '/../Model/conexion.php';
+require_once __DIR__ . '/../Helper/mailer_helper.php';
+
+$id_usuario_actual = $_SESSION['id_usuario'] ?? null;
+if (!$id_usuario_actual) {
+    header("Location: ../View/login_view.php");
+    exit();
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $id_requerimiento = $_POST['id_requerimiento'] ?? null;
+    $accion = $_POST['accion'] ?? null; 
+
+    if ($id_requerimiento && $accion) {
+        try {
+            $conexion->beginTransaction();
+
+            $sqlCheck = "SELECT COUNT(*) FROM procesos WHERE id_requerimiento_fk = :id_req";
+            $stmtCheck = $conexion->prepare($sqlCheck);
+            $stmtCheck->execute([':id_req' => $id_requerimiento]);
+            $existe = $stmtCheck->fetchColumn();
+
+            if ($accion === 'aceptar') {
+                $nuevo_estado = 'pendiente_administracion'; 
+
+                $sqlReq = "UPDATE requerimientos SET estado = :estado, motivo_rechazo = NULL WHERE id_requerimiento = :id_req";
+                $stmtReq = $conexion->prepare($sqlReq);
+                $stmtReq->execute([
+                    ':estado' => $nuevo_estado,
+                    ':id_req' => $id_requerimiento
+                ]);
+
+                if ($existe > 0) {
+                    $sql = "UPDATE procesos SET estado = :estado, motivo_rechazo = NULL, fecha_actualizada = NOW() WHERE id_requerimiento_fk = :id_req";
+                    $stmt = $conexion->prepare($sql);
+                    $stmt->execute([
+                        ':estado' => $nuevo_estado,
+                        ':id_req' => $id_requerimiento
+                    ]);
+                } else {
+                    $sql = "INSERT INTO procesos (id_requerimiento_fk, estado, motivo_rechazo, fecha_actualizada) VALUES (:id_req, :estado, NULL, NOW())";
+                    $stmt = $conexion->prepare($sql);
+                    $stmt->execute([
+                        ':id_req' => $id_requerimiento,
+                        ':estado' => $nuevo_estado
+                    ]);
+                }
+
+                $conexion->commit();
+                header("Location: ../View/solicitud_ge_view.php?aprobado=1");
+                exit();
+
+            } elseif ($accion === 'rechazar') {
+                $motivo = trim($_POST['motivo_rechazo'] ?? 'Sin motivo especificado');
+                $nuevo_estado = 'rechazado';
+
+                $sqlReq = "UPDATE requerimientos SET estado = :estado, motivo_rechazo = :motivo WHERE id_requerimiento = :id_req";
+                $stmtReq = $conexion->prepare($sqlReq);
+                $stmtReq->execute([
+                    ':estado' => $nuevo_estado,
+                    ':motivo' => $motivo,
+                    ':id_req' => $id_requerimiento
+                ]);
+
+                if ($existe > 0) {
+                    $sql = "UPDATE procesos SET estado = :estado, motivo_rechazo = :motivo, fecha_actualizada = NOW() WHERE id_requerimiento_fk = :id_req";
+                    $stmt = $conexion->prepare($sql);
+                    $stmt->execute([
+                        ':estado' => $nuevo_estado,
+                        ':motivo' => $motivo,
+                        ':id_req' => $id_requerimiento
+                    ]);
+                } else {
+                    $sql = "INSERT INTO procesos (id_requerimiento_fk, estado, motivo_rechazo, fecha_actualizada) VALUES (:id_req, :estado, :motivo, NOW())";
+                    $stmt = $conexion->prepare($sql);
+                    $stmt->execute([
+                        ':id_req' => $id_requerimiento,
+                        ':estado' => $nuevo_estado,
+                        ':motivo' => $motivo
+                    ]);
+                }
+
+                $sqlUser = "SELECT u.correo, COALESCE(t.nombres, u.correo) AS nombre, r.nombre_solicitud 
+                            FROM requerimientos r 
+                            INNER JOIN usuario u ON r.id_usuario_f = u.id_usuario 
+                            LEFT JOIN trabajador t ON u.id_trabajador_fk = t.id 
+                            WHERE r.id_requerimiento = :id_req";
+                $stmtUser = $conexion->prepare($sqlUser);
+                $stmtUser->execute([':id_req' => $id_requerimiento]);
+                $datosUsuario = $stmtUser->fetch(PDO::FETCH_ASSOC);
+
+                $conexion->commit();
+
+                if ($datosUsuario && !empty($datosUsuario['correo'])) {
+                    $asunto = "Requerimiento Rechazado: " . $datosUsuario['nombre_solicitud'];
+                    $cuerpo = "Hola <b>" . htmlspecialchars($datosUsuario['nombre']) . "</b>,<br><br>
+                               Lamentamos informarle que su requerimiento <b>" . htmlspecialchars($datosUsuario['nombre_solicitud']) . "</b> ha sido <b>rechazado</b> por gerencia.<br><br>
+                               <b>Motivo del rechazo:</b><br>
+                               <p style='color: red;'>" . nl2br(htmlspecialchars($motivo)) . "</p><br>
+                               Puede ingresar al sistema para editar su requerimiento y volver a enviarlo.<br><br>
+                               Atentamente,<br>
+                               <b>Gerencia</b>";
+
+                    enviarCorreoSistema($datosUsuario['correo'], $datosUsuario['nombre'], $asunto, $cuerpo);
+                }
+
+                header("Location: ../View/solicitud_ge_view.php?rechazado=1");
+                exit();
+            }
+
+        } catch (Exception $e) {
+            if ($conexion->inTransaction()) {
+                $conexion->rollBack();
+            }
+            header("Location: ../View/solicitud_ge_view.php?error=" . urlencode($e->getMessage()));
+            exit();
+        }
+    } else {
+        header("Location: ../View/solicitud_ge_view.php?error=Datos+incompletos");
+        exit();
+    }
+} else {
+    header("Location: ../View/solicitud_ge_view.php");
+    exit();
+}
+?>
+
+
+
+
+solicitud_crud_controllerfk:
+<?php
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+require_once __DIR__ . '/../Model/conexion.php';
+
+try {
+    $stmt_usr = $conexion->prepare("
+        SELECT u.id_usuario, u.rol, COALESCE(t.nombres, u.correo) AS nombre_usuario 
+        FROM usuario u 
+        LEFT JOIN trabajador t ON u.id_trabajador_fk = t.id 
+        ORDER BY nombre_usuario ASC
+    ");
+    $stmt_usr->execute();
+    $usuarios = $stmt_usr->fetchAll(PDO::FETCH_ASSOC);
+
+    $where = [];
+    $params = [];
+
+    if (!empty($_GET['id_buscado'])) {
+        $where[] = "r.nombre_solicitud LIKE ?";
+        $params[] = "%" . $_GET['id_buscado'] . "%";
+    }
+
+    if (!empty($_GET['id_usuario_f'])) {
+        $where[] = "r.id_usuario_f = ?";
+        $params[] = $_GET['id_usuario_f'];
+    }
+
+    $sql = "SELECT r.*, COALESCE(t.nombres, u.correo) AS nombre_usuario 
+            FROM requerimientos r 
+            LEFT JOIN usuario u ON r.id_usuario_f = u.id_usuario 
+            LEFT JOIN trabajador t ON u.id_trabajador_fk = t.id";
+    
+    if (!empty($where)) {
+        $sql .= " WHERE " . implode(" AND ", $where);
+    }
+    
+    $sql .= " ORDER BY r.id_requerimiento DESC";
+
+    $stmt = $conexion->prepare($sql);
+    $stmt->execute($params);
+    $requerimientos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+} catch (Exception $e) {
+    $error_msg = "Error al cargar los datos: " . $e->getMessage();
+    $requerimientos = [];
+    $usuarios = [];
+}
+?>
+
+
+
+solicitud_crud_controller:
+<?php
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+require_once __DIR__ . '/../Model/conexion.php';
+
+try {
+    // Traer a todos los usuarios para los filtros
+    $stmt_usr = $conexion->prepare("
+        SELECT u.id_usuario, u.rol, COALESCE(t.nombres, u.correo) AS nombre_usuario 
+        FROM usuario u 
+        LEFT JOIN trabajador t ON u.id_trabajador_fk = t.id 
+        ORDER BY nombre_usuario ASC
+    ");
+    $stmt_usr->execute();
+    $usuarios = $stmt_usr->fetchAll(PDO::FETCH_ASSOC);
+
+    // CORRECCIÓN CLAVE: La administración SOLO debe ver los que están en 'pendiente_administracion'
+    $where = ["r.estado = 'pendiente_administracion'"];
+    $params = [];
+
+    if (!empty($_GET['id_buscado'])) {
+        $where[] = "r.nombre_solicitud LIKE ?";
+        $params[] = "%" . $_GET['id_buscado'] . "%";
+    }
+
+    if (!empty($_GET['id_usuario_f'])) {
+        $where[] = "r.id_usuario_f = ?";
+        $params[] = $_GET['id_usuario_f'];
+    }
+
+    // Consulta con el filtro estricto de estado para administración
+    $sql = "SELECT r.*, COALESCE(t.nombres, u.correo) AS nombre_usuario 
+            FROM requerimientos r 
+            LEFT JOIN usuario u ON r.id_usuario_f = u.id_usuario 
+            LEFT JOIN trabajador t ON u.id_trabajador_fk = t.id 
+            WHERE " . implode(" AND ", $where) . " 
+            ORDER BY r.id_requerimiento DESC";
+
+    $stmt = $conexion->prepare($sql);
+    $stmt->execute($params);
+    $requerimientos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+} catch (Exception $e) {
+    $error_msg = "Error al cargar los datos: " . $e->getMessage();
+    $requerimientos = [];
+    $usuarios = [];
+}
+?>
