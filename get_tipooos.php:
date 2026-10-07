@@ -1,0 +1,137 @@
+get_tickets.php:  
+<?php
+header('Content-Type: application/json');
+require_once __DIR__ . '/../config/database.php';
+
+$estado = $_GET['estado'] ?? '';
+$id_tipo = $_GET['id_tipo'] ?? ''; 
+$conn = getConnection();
+
+$sql = "SELECT t.id, t.nombre_solicitante, t.celular, t.email, t.descripcion, t.id_tiporeporte_fk, t.estado, t.prioridad, t.creado_en, tr.nombre AS nombre_tipo 
+        FROM tck_tickets t 
+        LEFT JOIN tipo_reporte tr ON t.id_tiporeporte_fk = tr.id_tipo
+        WHERE 1=1";
+
+$params = [];
+$types = "";
+
+if ($estado !== '') {
+    $sql .= " AND t.estado = ?";
+    $params[] = $estado;
+    $types .= "s";
+}
+
+if ($id_tipo !== '') {
+    // Corregido: apunta a la columna de la tabla de tickets
+    $sql .= " AND t.id_tiporeporte_fk = ?";
+    $params[] = $id_tipo;
+    $types .= "i"; 
+}
+
+$sql .= " ORDER BY t.creado_en DESC";
+$stmt = $conn->prepare($sql);
+
+if ($types) {
+    $stmt->bind_param($types, ...$params);
+}
+
+$stmt->execute();
+$result = $stmt->get_result();
+$tickets = [];
+
+$estados_posibles = ['Nuevo', 'En Progreso', 'Resuelto', 'Cerrado'];
+$orden_estados = array_flip($estados_posibles);
+
+while ($row = $result->fetch_assoc()) {
+    $ticket_id = $row['id'];
+    $estado_actual = $row['estado'];
+    $idx_actual = $orden_estados[$estado_actual] ?? 0;
+    
+    // Obtener imágenes 
+    $img_sql = "SELECT imagen, imagen_tipo FROM tck_imagenes WHERE ticket_id = ?";
+    $img_stmt = $conn->prepare($img_sql);
+    $img_stmt->bind_param("i", $ticket_id);
+    $img_stmt->execute();
+    $img_res = $img_stmt->get_result();
+    
+    $imagenes = [];
+    while ($img_row = $img_res->fetch_assoc()) {
+        $imagenes[] = [
+            'url' => 'data:' . $img_row['imagen_tipo'] . ';base64,' . base64_encode($img_row['imagen'])
+        ];
+    }
+    $img_stmt->close();
+
+    $timeline_html = '<div class="timeline-steps">';
+    
+    foreach ($estados_posibles as $index => $est) {
+        $step_num = $index + 1;
+        $idx_est = $orden_estados[$est];
+        
+        $clase = '';
+        $disabled_attr = '';
+
+        if ($est === $estado_actual) {
+            $clase = 'active';
+        } elseif ($idx_est < $idx_actual) {
+            $clase = 'completed disabled-step'; // Ya pasó, bloqueado
+            $disabled_attr = 'disabled style="cursor: not-allowed; opacity: 0.7;"';
+        } else {
+            $clase = 'pending';
+        }
+
+        $timeline_html .= '<button type="button" class="timeline-step ' . $clase . '" data-id="' . $ticket_id . '" data-estado="' . $est . '" data-actual="' . $estado_actual . '" ' . $disabled_attr . '>';
+        $timeline_html .= '<div class="circle">' . ($idx_est < $idx_actual ? '✓' : $step_num) . '</div>';
+        $timeline_html .= '<span class="label">' . $est . '</span>';
+        $timeline_html .= '</button>';
+    }
+    $timeline_html .= '</div>';
+
+    $tickets[] = [
+        'id' => $row['id'],
+        'numero' => str_pad($row['id'], 4, '0', STR_PAD_LEFT),
+        'nombre_solicitante' => $row['nombre_solicitante'],
+        'celular' => $row['celular'],
+        'email' => $row['email'],
+        'descripcion' => $row['descripcion'],
+        'tipo_reporte' => $row['nombre_tipo'] ?? 'General',
+        'prioridad' => $row['prioridad'], 
+        'estado' => $estado_actual,
+        'estado_html' => $timeline_html,
+        'creado_en' => date('d/m/Y', strtotime($row['creado_en'])),
+        'imagenes' => $imagenes
+    ];
+}
+
+echo json_encode(['success' => true, 'tickets' => $tickets]);
+$stmt->close();
+?>
+
+
+
+
+get_tipos.php:
+<?php
+header('Content-Type: application/json');
+require_once __DIR__ . '/../config/database.php';
+
+try {
+    $conn = getConnection();
+    
+    $result = $conn->query("SELECT id_tipo, nombre FROM tipo_reporte");
+    
+    if (!$result) {
+        throw new Exception("Error en la consulta: " . $conn->error);
+    }
+
+    $tipos = [];
+    while ($row = $result->fetch_assoc()) {
+        $tipos[] = $row;
+    }
+
+    echo json_encode(['success' => true, 'tipos' => $tipos]);
+
+} catch (Exception $e) {
+    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+}
+?>
